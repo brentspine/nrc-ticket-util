@@ -4,7 +4,7 @@ Vencord plugin that adds client side utility for the [NRC Ticketbot](https://git
 Vencord docs: https://deepwiki.com/Vendicated/Vencord
 
 ## Prerequisites
-- **Node.js 18+** required (specified in engines) [1](#1-0) 
+- **Node.js 18+** required
 - Git installed
 
 ## Then just run the following commands:
