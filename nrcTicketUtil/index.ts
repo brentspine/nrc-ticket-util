@@ -4,18 +4,69 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import { ApplicationCommandInputType } from "@api/Commands";
 import { definePluginSettings } from "@api/Settings";
+import {
+    closeModal,
+    ModalCloseButton,
+    ModalContent,
+    ModalFooter,
+    ModalHeader,
+    ModalProps,
+    ModalRoot,
+    ModalSize,
+    openModal
+} from "@utils/modal";
 import definePlugin, { OptionType } from "@utils/types";
 import {
+    ChannelRouter,
     ChannelStore,
     FluxDispatcher as Dispatcher,
     GuildChannelStore,
     SelectedChannelStore,
-    UserStore
+    UserStore,
+    useState
 } from "@webpack/common";
 
 type SoundKind = "none" | "beep" | "chime" | "custom";
 type ClaimWhere = "name" | "topic" | "either";
+
+type ClaimedTicketInfo = {
+    id: string;
+    guildId: string;
+    name: string;
+    topic: string;
+    position: number;
+};
+
+const UI = {
+    modalBg: "var(--modal-background, var(--background-primary, #1e1f22))",
+    panelBg: "var(--background-secondary, #2b2d31)",
+    panelBgAlt: "var(--background-secondary-alt, #232428)",
+    inputBg: "var(--input-background, #1e1f22)",
+    border: "var(--background-modifier-accent, rgba(255, 255, 255, 0.12))",
+    text: "var(--text-primary, var(--header-primary, #f2f3f5))",
+    muted: "var(--text-muted, #b5bac1)",
+    brand: "var(--brand-500, #5865f2)",
+    brandHover: "var(--brand-560, #4752c4)",
+    danger: "var(--status-danger, #ed4245)"
+};
+
+function makeRange(start: number, end: number, step: number): number[] {
+    const out: number[] = [];
+    const safeStep = step <= 0 ? 1 : step;
+
+    let value = start;
+
+    while (value <= end + 1e-9) {
+        out.push(Number(value.toFixed(10)));
+        value += safeStep;
+    }
+
+    if (out.length >= 2) return out;
+
+    return [start, end];
+}
 
 const settings = definePluginSettings({
     enabled: {
@@ -168,54 +219,73 @@ let lastMessageSoundAt = 0;
 const parentByChannelId = new Map<string, string | null>();
 let snapCategoryId = "";
 
-function makeRange(start: number, end: number, step: number): number[] {
-    const out: number[] = [];
-    const safeStep = step <= 0 ? 1 : step;
-
-    let v = start;
-    while (v <= end + 1e-9) {
-        out.push(Number(v.toFixed(10)));
-        v += safeStep;
-    }
-
-    if (out.length >= 2) return out;
-    return [start, end];
-}
-
 function extractChannel(action: any): any | null {
-    const ch = action?.channel;
-    if (ch?.id) return ch;
+    const channel = action?.channel;
 
-    const upd = action?.updatedChannel;
-    if (upd?.id) return upd;
+    if (channel?.id) return channel;
+
+    const updatedChannel = action?.updatedChannel;
+
+    if (updatedChannel?.id) return updatedChannel;
 
     return null;
 }
 
 function getGuildIdForCategory(categoryId: string): string | null {
-    const cat = ChannelStore.getChannel(categoryId) as any;
-    const gid = cat?.guild_id as string | undefined;
+    const category = ChannelStore.getChannel(categoryId) as any;
+    const guildId = category?.guild_id as string | undefined;
 
-    if (!gid) return null;
-    return gid;
+    if (!guildId) return null;
+
+    return guildId;
+}
+
+function getCurrentGuildId(): string | null {
+    const selectedChannelId = SelectedChannelStore.getChannelId();
+    const selectedChannel = ChannelStore.getChannel(selectedChannelId) as any;
+    const guildId = selectedChannel?.guild_id as string | undefined;
+
+    if (!guildId) return null;
+
+    return guildId;
+}
+
+function getGuildIdForTicketSearch(): string | null {
+    const categoryId = String(settings.store.categoryId ?? "").trim();
+    const guildIdFromCategory = categoryId ? getGuildIdForCategory(categoryId) : null;
+
+    if (guildIdFromCategory) return guildIdFromCategory;
+
+    return getCurrentGuildId();
 }
 
 function getGuildChannels(guildId: string): any[] {
     const data = GuildChannelStore.getChannels(guildId) as any;
+
     if (!data) return [];
 
     const selectable = data.SELECTABLE;
-    if (Array.isArray(selectable)) return selectable.map((e: any) => e?.channel ?? e).filter(Boolean);
 
-    const channels = data.channels;
-    const selectable2 = channels?.SELECTABLE;
-    if (Array.isArray(selectable2)) return selectable2.map((e: any) => e?.channel ?? e).filter(Boolean);
+    if (Array.isArray(selectable)) {
+        return selectable
+            .map((entry: any) => entry?.channel ?? entry)
+            .filter(Boolean);
+    }
+
+    const selectableFromChannels = data.channels?.SELECTABLE;
+
+    if (Array.isArray(selectableFromChannels)) {
+        return selectableFromChannels
+            .map((entry: any) => entry?.channel ?? entry)
+            .filter(Boolean);
+    }
 
     return [];
 }
 
 function refreshSnapshotIfNeeded(): void {
     const categoryId = String(settings.store.categoryId ?? "").trim();
+
     if (!categoryId) return;
     if (categoryId === snapCategoryId) return;
 
@@ -223,35 +293,49 @@ function refreshSnapshotIfNeeded(): void {
     parentByChannelId.clear();
 
     const guildId = getGuildIdForCategory(categoryId);
+
     if (!guildId) return;
 
-    const chans = getGuildChannels(guildId);
-    chans.forEach(ch => {
-        if (!ch?.id) return;
-        parentByChannelId.set(ch.id, ch.parent_id ?? null);
+    const channels = getGuildChannels(guildId);
+
+    channels.forEach(channel => {
+        if (!channel?.id) return;
+
+        parentByChannelId.set(channel.id, channel.parent_id ?? null);
     });
 }
 
 function shouldThrottle(now: number, last: number, cooldownMs: number): boolean {
-    const cd = Math.max(0, cooldownMs | 0);
-    return now - last < cd;
+    const cooldown = Math.max(0, cooldownMs | 0);
+
+    return now - last < cooldown;
 }
 
 function playCustom(url: string, volume: number): void {
-    const u = (url ?? "").trim();
-    if (!u) return;
+    const source = (url ?? "").trim();
 
-    const a = new Audio(u);
-    a.volume = Math.max(0, Math.min(1, volume));
-    void a.play().catch(() => void 0);
+    if (!source) return;
+
+    const audio = new Audio(source);
+    audio.volume = Math.max(0, Math.min(1, volume));
+
+    void audio.play().catch(() => void 0);
+}
+
+function getAudioContext(): AudioContext | null {
+    const AudioCtx = window.AudioContext ?? (window as any).webkitAudioContext;
+
+    if (!AudioCtx) return null;
+
+    audioCtx = audioCtx ?? new AudioCtx();
+
+    return audioCtx;
 }
 
 function playBeep(volume: number): void {
-    const AudioCtx = window.AudioContext ?? (window as any).webkitAudioContext;
-    if (!AudioCtx) return;
+    const ctx = getAudioContext();
 
-    audioCtx = audioCtx ?? new AudioCtx();
-    const ctx = audioCtx;
+    if (!ctx) return;
 
     void ctx.resume().catch(() => void 0);
 
@@ -259,13 +343,13 @@ function playBeep(volume: number): void {
     const gain = ctx.createGain();
 
     const t0 = ctx.currentTime;
-    const v = Math.max(0.0001, Math.min(1, volume));
+    const safeVolume = Math.max(0.0001, Math.min(1, volume));
 
     osc.type = "sine";
     osc.frequency.setValueAtTime(880, t0);
 
     gain.gain.setValueAtTime(0.0001, t0);
-    gain.gain.exponentialRampToValueAtTime(v, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(safeVolume, t0 + 0.01);
     gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.18);
 
     osc.connect(gain);
@@ -276,11 +360,9 @@ function playBeep(volume: number): void {
 }
 
 function playChime(volume: number): void {
-    const AudioCtx = window.AudioContext ?? (window as any).webkitAudioContext;
-    if (!AudioCtx) return;
+    const ctx = getAudioContext();
 
-    audioCtx = audioCtx ?? new AudioCtx();
-    const ctx = audioCtx;
+    if (!ctx) return;
 
     void ctx.resume().catch(() => void 0);
 
@@ -288,14 +370,14 @@ function playChime(volume: number): void {
     const gain = ctx.createGain();
 
     const t0 = ctx.currentTime;
-    const v = Math.max(0.0001, Math.min(1, volume));
+    const safeVolume = Math.max(0.0001, Math.min(1, volume));
 
     osc.type = "triangle";
     osc.frequency.setValueAtTime(660, t0);
     osc.frequency.exponentialRampToValueAtTime(1320, t0 + 0.12);
 
     gain.gain.setValueAtTime(0.0001, t0);
-    gain.gain.exponentialRampToValueAtTime(v, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(safeVolume, t0 + 0.01);
     gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.35);
 
     osc.connect(gain);
@@ -312,33 +394,105 @@ function playSound(kind: SoundKind, customUrl: string, volume: number): void {
     if (kind === "chime") playChime(volume);
 }
 
+function getChannelTopic(channel: any): string {
+    return String(channel?.topic ?? channel?.rawTopic ?? "");
+}
+
 function channelTextForClaim(channel: any, where: ClaimWhere): string {
     const name = String(channel?.name ?? "");
-    const topic = String(channel?.topic ?? "");
+    const topic = getChannelTopic(channel);
 
     if (where === "name") return name;
     if (where === "topic") return topic;
+
     return `${name}\n${topic}`;
 }
 
-function isClaimedChannel(channelId: string): boolean {
+function channelMatchesClaim(channel: any): boolean {
     const emoji = String(settings.store.claimEmoji ?? "").trim();
-    if (!emoji) return false;
-
-    const ch = ChannelStore.getChannel(channelId) as any;
-    if (!ch) return false;
-
     const categoryId = String(settings.store.categoryId ?? "").trim();
     const scoped = Boolean(settings.store.claimOnlyInWatchedCategory);
 
-    if (scoped && categoryId) {
-        if (ch.parent_id !== categoryId) return false;
+    if (!emoji) return false;
+    if (!channel?.id) return false;
+    if (channel.type === 4) return false;
+    if (scoped && !categoryId) return false;
+    if (scoped && channel.parent_id !== categoryId) return false;
+
+    const where = (settings.store.claimWhere ?? "either") as ClaimWhere;
+    const haystack = channelTextForClaim(channel, where);
+
+    return haystack.includes(emoji);
+}
+
+function isClaimedChannel(channelId: string): boolean {
+    const channel = ChannelStore.getChannel(channelId) as any;
+
+    if (!channel) return false;
+
+    return channelMatchesClaim(channel);
+}
+
+function getClaimedTicketChannels(): ClaimedTicketInfo[] {
+    const guildId = getGuildIdForTicketSearch();
+
+    if (!guildId) return [];
+
+    return getGuildChannels(guildId)
+        .filter(channelMatchesClaim)
+        .map(channel => ({
+            id: String(channel.id),
+            guildId,
+            name: String(channel.name ?? channel.id),
+            topic: getChannelTopic(channel),
+            position: Number(channel.position ?? 0)
+        }))
+        .sort((a, b) => {
+            const positionDiff = a.position - b.position;
+
+            if (positionDiff !== 0) return positionDiff;
+
+            return a.name.localeCompare(b.name);
+        });
+}
+
+function getTicketPath(ticket: ClaimedTicketInfo): string {
+    return `/channels/${ticket.guildId}/${ticket.id}`;
+}
+
+function getTicketLink(ticket: ClaimedTicketInfo): string {
+    return `https://discord.com${getTicketPath(ticket)}`;
+}
+
+function openTicket(ticket: ClaimedTicketInfo): void {
+    const transitionToChannel = (ChannelRouter as any)?.transitionToChannel;
+
+    if (typeof transitionToChannel === "function") {
+        transitionToChannel(ticket.id);
+        return;
     }
 
-    const where = settings.store.claimWhere as ClaimWhere;
-    const hay = channelTextForClaim(ch, where);
+    const link = document.querySelector(`a[href="${getTicketPath(ticket)}"]`) as HTMLAnchorElement | null;
 
-    return hay.includes(emoji);
+    if (link) {
+        link.click();
+        return;
+    }
+
+    window.location.href = getTicketLink(ticket);
+}
+
+async function copyTicketLink(ticket: ClaimedTicketInfo): Promise<boolean> {
+    const clipboard = navigator.clipboard;
+
+    if (!clipboard) return false;
+
+    try {
+        await clipboard.writeText(getTicketLink(ticket));
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function shouldPlayMessageSound(channelId: string): boolean {
@@ -346,9 +500,11 @@ function shouldPlayMessageSound(channelId: string): boolean {
     if (!isClaimedChannel(channelId)) return false;
 
     const onlyWhenUnfocused = Boolean(settings.store.onlyWhenUnfocused);
+
     if (onlyWhenUnfocused && document.hasFocus()) return false;
 
     const muteWhenViewing = Boolean(settings.store.muteWhenViewingChannel);
+
     if (muteWhenViewing && SelectedChannelStore.getChannelId() === channelId) return false;
 
     return true;
@@ -359,29 +515,31 @@ function onChannelCreate(action: any): void {
 
     refreshSnapshotIfNeeded();
 
-    const ch = extractChannel(action);
-    if (!ch) return;
+    const channel = extractChannel(action);
+
+    if (!channel) return;
 
     const categoryId = String(settings.store.categoryId ?? "").trim();
+
     if (!categoryId) return;
-
     if (!settings.store.playOnNewChannel) return;
-    if (ch.parent_id !== categoryId) return;
-    if (ch.type === 4) return;
+    if (channel.parent_id !== categoryId) return;
+    if (channel.type === 4) return;
 
-    parentByChannelId.set(ch.id, ch.parent_id ?? null);
+    parentByChannelId.set(channel.id, channel.parent_id ?? null);
 
     const now = Date.now();
-    const cd = Number(settings.store.newChannelCooldownMs ?? 0);
-    if (shouldThrottle(now, lastNewChannelSoundAt, cd)) return;
+    const cooldown = Number(settings.store.newChannelCooldownMs ?? 0);
+
+    if (shouldThrottle(now, lastNewChannelSoundAt, cooldown)) return;
 
     lastNewChannelSoundAt = now;
 
     const kind = settings.store.newChannelSound as SoundKind;
     const url = String(settings.store.newChannelSoundUrl ?? "");
-    const vol = Number(settings.store.newChannelVolume ?? 0.6);
+    const volume = Number(settings.store.newChannelVolume ?? 0.6);
 
-    playSound(kind, url, vol);
+    playSound(kind, url, volume);
 }
 
 function onChannelUpdate(action: any): void {
@@ -389,83 +547,448 @@ function onChannelUpdate(action: any): void {
 
     refreshSnapshotIfNeeded();
 
-    const ch = extractChannel(action);
-    if (!ch) return;
+    const channel = extractChannel(action);
+
+    if (!channel) return;
 
     const categoryId = String(settings.store.categoryId ?? "").trim();
+
     if (!categoryId) return;
 
-    const prevParent = parentByChannelId.get(ch.id) ?? null;
-    const nextParent = (ch.parent_id ?? null) as string | null;
+    const prevParent = parentByChannelId.get(channel.id) ?? null;
+    const nextParent = (channel.parent_id ?? null) as string | null;
 
-    parentByChannelId.set(ch.id, nextParent);
+    parentByChannelId.set(channel.id, nextParent);
 
     if (!settings.store.playOnMovedIntoCategory) return;
     if (!settings.store.playOnNewChannel) return;
-
     if (prevParent === categoryId) return;
     if (nextParent !== categoryId) return;
-    if (ch.type === 4) return;
+    if (channel.type === 4) return;
 
     const now = Date.now();
-    const cd = Number(settings.store.newChannelCooldownMs ?? 0);
-    if (shouldThrottle(now, lastNewChannelSoundAt, cd)) return;
+    const cooldown = Number(settings.store.newChannelCooldownMs ?? 0);
+
+    if (shouldThrottle(now, lastNewChannelSoundAt, cooldown)) return;
 
     lastNewChannelSoundAt = now;
 
     const kind = settings.store.newChannelSound as SoundKind;
     const url = String(settings.store.newChannelSoundUrl ?? "");
-    const vol = Number(settings.store.newChannelVolume ?? 0.6);
+    const volume = Number(settings.store.newChannelVolume ?? 0.6);
 
-    playSound(kind, url, vol);
+    playSound(kind, url, volume);
 }
 
-function onMessageCreate(e: any): void {
+function onMessageCreate(event: any): void {
     if (!settings.store.enabled) return;
-    if (e?.type !== "MESSAGE_CREATE") return;
-    if (e.optimistic) return;
+    if (event?.type !== "MESSAGE_CREATE") return;
+    if (event.optimistic) return;
 
-    const msg = e.message;
-    if (!msg) return;
+    const message = event.message;
 
-    if (msg.state === "SENDING") return;
+    if (!message) return;
+    if (message.state === "SENDING") return;
 
     const ignoreBots = Boolean(settings.store.ignoreBots);
-    if (ignoreBots && msg.author?.bot) return;
+
+    if (ignoreBots && message.author?.bot) return;
 
     const ignoreSelf = Boolean(settings.store.ignoreSelf);
-    if (ignoreSelf) {
-        const me = UserStore.getCurrentUser?.();
-        const myId = me?.id;
-        if (myId && msg.author?.id === myId) return;
-    }
+    const me = ignoreSelf ? UserStore.getCurrentUser?.() : null;
+    const myId = me?.id;
 
-    const channelId = String(e.channelId ?? "");
+    if (ignoreSelf && myId && message.author?.id === myId) return;
+
+    const channelId = String(event.channelId ?? "");
+
     if (!channelId) return;
-
     if (!shouldPlayMessageSound(channelId)) return;
 
     const now = Date.now();
-    const cd = Number(settings.store.messageCooldownMs ?? 0);
-    if (shouldThrottle(now, lastMessageSoundAt, cd)) return;
+    const cooldown = Number(settings.store.messageCooldownMs ?? 0);
+
+    if (shouldThrottle(now, lastMessageSoundAt, cooldown)) return;
 
     lastMessageSoundAt = now;
 
     const kind = settings.store.messageSound as SoundKind;
     const url = String(settings.store.messageSoundUrl ?? "");
-    const vol = Number(settings.store.messageVolume ?? 0.7);
+    const volume = Number(settings.store.messageVolume ?? 0.7);
 
-    playSound(kind, url, vol);
+    playSound(kind, url, volume);
+}
+
+function SmallButton(props: {
+    children: any;
+    kind?: "primary" | "secondary" | "danger";
+    onClick: () => void;
+}): JSX.Element {
+    const kind = props.kind ?? "secondary";
+    const background = kind === "primary" ? UI.brand : UI.panelBgAlt;
+    const border = kind === "primary" ? UI.brand : UI.border;
+
+    return (
+        <button
+            type="button"
+            onClick={props.onClick}
+            style={{
+                background,
+                border: `1px solid ${border}`,
+                borderRadius: "8px",
+                color: UI.text,
+                cursor: "pointer",
+                fontSize: "13px",
+                fontWeight: 700,
+                minHeight: "32px",
+                padding: "6px 12px"
+            }}
+        >
+            {props.children}
+        </button>
+    );
+}
+
+function TicketRow(props: {
+    ticket: ClaimedTicketInfo;
+    onOpen: () => void;
+}): JSX.Element {
+    const [copied, setCopied] = useState(false);
+    const ticket = props.ticket;
+    const topic = ticket.topic.trim();
+
+    async function onCopy(): Promise<void> {
+        const success = await copyTicketLink(ticket);
+
+        setCopied(success);
+
+        window.setTimeout(() => setCopied(false), 1300);
+    }
+
+    return (
+        <div
+            style={{
+                alignItems: "center",
+                background: UI.panelBg,
+                border: `1px solid ${UI.border}`,
+                borderRadius: "12px",
+                display: "grid",
+                gap: "14px",
+                gridTemplateColumns: "minmax(0, 1fr) auto",
+                padding: "12px 14px"
+            }}
+        >
+            <div style={{ minWidth: 0 }}>
+                <div
+                    style={{
+                        alignItems: "center",
+                        color: UI.text,
+                        display: "flex",
+                        fontSize: "15px",
+                        fontWeight: 800,
+                        gap: "6px",
+                        lineHeight: "20px"
+                    }}
+                >
+                    <span style={{ color: UI.muted }}>#</span>
+
+                    <span
+                        style={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap"
+                        }}
+                    >
+                        {ticket.name}
+                    </span>
+                </div>
+
+                <div
+                    style={{
+                        color: UI.muted,
+                        fontSize: "12px",
+                        lineHeight: "18px",
+                        marginTop: "3px",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap"
+                    }}
+                >
+                    {topic || ticket.id}
+                </div>
+            </div>
+
+            <div
+                style={{
+                    display: "flex",
+                    flexShrink: 0,
+                    gap: "8px"
+                }}
+            >
+                <SmallButton onClick={onCopy}>
+                    {copied ? "Copied" : "Copy"}
+                </SmallButton>
+
+                <SmallButton kind="primary" onClick={props.onOpen}>
+                    Open
+                </SmallButton>
+            </div>
+        </div>
+    );
+}
+
+function ClaimedTicketsModal(props: {
+    modalProps: ModalProps;
+    onClose: () => void;
+}): JSX.Element {
+    const [query, setQuery] = useState("");
+    const [tickets, setTickets] = useState(getClaimedTicketChannels);
+
+    const emoji = String(settings.store.claimEmoji ?? "").trim();
+    const categoryId = String(settings.store.categoryId ?? "").trim();
+    const claimWhere = String(settings.store.claimWhere ?? "either");
+    const scoped = Boolean(settings.store.claimOnlyInWatchedCategory);
+    const queryLower = query.trim().toLowerCase();
+
+    const visibleTickets = queryLower
+        ? tickets.filter(ticket => {
+            const haystack = `${ticket.name}\n${ticket.topic}\n${ticket.id}`.toLowerCase();
+
+            return haystack.includes(queryLower);
+        })
+        : tickets;
+
+    return (
+        <ModalRoot {...props.modalProps} size={ModalSize.LARGE}>
+            <ModalHeader>
+                <div
+                    style={{
+                        alignItems: "center",
+                        background: UI.modalBg,
+                        display: "flex",
+                        justifyContent: "space-between",
+                        width: "100%"
+                    }}
+                >
+                    <div>
+                        <div
+                            style={{
+                                color: UI.text,
+                                fontSize: "21px",
+                                fontWeight: 900,
+                                lineHeight: "26px"
+                            }}
+                        >
+                            Claimed Tickets {emoji}
+                        </div>
+
+                        <div
+                            style={{
+                                color: UI.muted,
+                                fontSize: "13px",
+                                lineHeight: "18px",
+                                marginTop: "3px"
+                            }}
+                        >
+                            {visibleTickets.length} of {tickets.length} tickets shown
+                        </div>
+                    </div>
+
+                    <ModalCloseButton onClick={props.onClose} />
+                </div>
+            </ModalHeader>
+
+            <ModalContent>
+                <div
+                    style={{
+                        background: UI.panelBgAlt,
+                        border: `1px solid ${UI.border}`,
+                        borderRadius: "12px",
+                        color: UI.muted,
+                        display: "grid",
+                        gap: "4px",
+                        marginBottom: "12px",
+                        padding: "12px 14px"
+                    }}
+                >
+                    <div>
+                        Category ID:{" "}
+                        <span style={{ color: UI.text }}>
+                            {categoryId || "not set"}
+                        </span>
+                    </div>
+
+                    <div>
+                        Scope:{" "}
+                        <span style={{ color: UI.text }}>
+                            {scoped ? "watched category only" : "current guild"}
+                        </span>
+                    </div>
+
+                    <div>
+                        Claim source:{" "}
+                        <span style={{ color: UI.text }}>
+                            {claimWhere}
+                        </span>
+                    </div>
+                </div>
+
+                <input
+                    placeholder="Search ticket name, topic, or channel ID"
+                    value={query}
+                    onChange={(event: any) => setQuery(event.currentTarget.value)}
+                    style={{
+                        background: UI.inputBg,
+                        border: `1px solid ${UI.border}`,
+                        borderRadius: "10px",
+                        boxSizing: "border-box",
+                        color: UI.text,
+                        fontSize: "14px",
+                        marginBottom: "12px",
+                        outline: "none",
+                        padding: "12px 14px",
+                        width: "100%"
+                    }}
+                />
+
+                {visibleTickets.length === 0 && (
+                    <div
+                        style={{
+                            background: UI.panelBg,
+                            border: `1px solid ${UI.border}`,
+                            borderRadius: "12px",
+                            color: UI.muted,
+                            padding: "20px",
+                            textAlign: "center"
+                        }}
+                    >
+                        No claimed tickets found. Check the emoji, category ID, and claim source setting.
+                    </div>
+                )}
+
+                <div
+                    style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "8px",
+                        maxHeight: "430px",
+                        overflowY: "auto",
+                        paddingRight: "4px"
+                    }}
+                >
+                    {visibleTickets.map(ticket => (
+                        <TicketRow
+                            key={ticket.id}
+                            ticket={ticket}
+                            onOpen={() => {
+                                props.onClose();
+                                openTicket(ticket);
+                            }}
+                        />
+                    ))}
+                </div>
+            </ModalContent>
+
+            <ModalFooter>
+                <div
+                    style={{
+                        display: "flex",
+                        gap: "8px",
+                        justifyContent: "flex-end",
+                        width: "100%"
+                    }}
+                >
+                    <SmallButton onClick={props.onClose}>
+                        Close
+                    </SmallButton>
+
+                    <SmallButton
+                        kind="primary"
+                        onClick={() => setTickets(getClaimedTicketChannels())}
+                    >
+                        Refresh
+                    </SmallButton>
+                </div>
+            </ModalFooter>
+        </ModalRoot>
+    );
+}
+
+function openClaimedTicketsModal(): void {
+    const key = openModal(modalProps => (
+        <ClaimedTicketsModal
+            modalProps={modalProps}
+            onClose={() => closeModal(key)}
+        />
+    ));
+}
+
+function SettingsAboutComponent(): JSX.Element {
+    return (
+        <div
+            style={{
+                background: UI.panelBg,
+                border: `1px solid ${UI.border}`,
+                borderRadius: "12px",
+                color: UI.text,
+                marginTop: "16px",
+                padding: "14px"
+            }}
+        >
+            <div
+                style={{
+                    fontSize: "15px",
+                    fontWeight: 800,
+                    marginBottom: "4px"
+                }}
+            >
+                Claimed Ticket Viewer
+            </div>
+
+            <div
+                style={{
+                    color: UI.muted,
+                    fontSize: "13px",
+                    lineHeight: "18px",
+                    marginBottom: "12px"
+                }}
+            >
+                Use /claimedtickets to open the viewer without sending a message.
+            </div>
+
+            <SmallButton kind="primary" onClick={openClaimedTicketsModal}>
+                Open Ticket Viewer
+            </SmallButton>
+        </div>
+    );
 }
 
 export default definePlugin({
     name: "NrcTicketUtil",
     description: "Plays configurable sounds for new ticket channels and for new messages in channels claimed by your emoji.",
     authors: [{ name: "Brentspine" }],
+    dependencies: ["CommandsAPI"],
     settings,
+
+    settingsAboutComponent() {
+        return <SettingsAboutComponent />;
+    },
+
+    commands: [
+        {
+            inputType: ApplicationCommandInputType.BUILT_IN,
+            name: "claimedtickets",
+            description: "Show all tickets claimed with your configured emoji",
+            options: [],
+            execute: () => {
+                openClaimedTicketsModal();
+            }
+        }
+    ],
 
     start() {
         refreshSnapshotIfNeeded();
+
         Dispatcher.subscribe("CHANNEL_CREATE", onChannelCreate);
         Dispatcher.subscribe("CHANNEL_UPDATE", onChannelUpdate);
         Dispatcher.subscribe("MESSAGE_CREATE", onMessageCreate);
