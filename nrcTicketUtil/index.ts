@@ -630,7 +630,6 @@ function SmallButton(props: {
 
     return (
         <button
-            type="button"
             onClick={props.onClick}
             style={{
                 background,
